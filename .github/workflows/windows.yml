@@ -1,0 +1,291 @@
+# Build, test and package a JUCE plug-in for Windows on a free GitHub-hosted runner. No Windows PC needed.
+#
+#   1. fetch JUCE at a pinned tag (cached)           5. pluginval (strictness 5) on the VST3
+#   2. configure + build with MSVC, Ninja, sccache   6. ZIP package + SHA-256, then test the ZIP like a user would
+#   3. run the headless unit-test exe                7. Inno Setup installer + silent install/upgrade/uninstall test (optional)
+#   4. (optional) fetch ONNX Runtime, hash-checked   8. upload the results as artifacts
+#
+# Run it: Actions tab > "windows" > Run workflow (or: gh workflow run windows.yml). Download the ZIP from the run page.
+# To use it for your own plug-in change the four names in `env:` below; everything else is generic.
+name: windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      juce_tag:
+        description: JUCE tag or commit to build against
+        default: "9.0.3"
+      build_type:
+        description: CMake build type
+        type: choice
+        options: [Release, RelWithDebInfo]
+        default: Release
+      strictness:
+        description: pluginval strictness level (1-10; 5 is what most hosts ask for)
+        default: "5"
+      unit_tests:
+        description: build and run the unit-test exe
+        type: boolean
+        default: true
+      package_zip:
+        description: build the ZIP (the free, unsigned route) and test it
+        type: boolean
+        default: true
+      installer:
+        description: build the Inno Setup installer and test install, upgrade and uninstall
+        type: boolean
+        default: false
+      onnxruntime:
+        description: fetch ONNX Runtime (the example plug-in does not use it; this shows the pattern)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      juce_tag:
+        type: string
+        default: "9.0.3"
+      build_type:
+        type: string
+        default: Release
+      strictness:
+        type: string
+        default: "5"
+      unit_tests:
+        type: boolean
+        default: true
+      package_zip:
+        type: boolean
+        default: true
+      installer:
+        type: boolean
+        default: false
+      onnxruntime:
+        type: boolean
+        default: false
+  # Uncomment to build when you push a version tag (on a private repo every Windows minute counts double, see README):
+  # push:
+  #   tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---- the four names to change for your own plug-in ----
+  PLUGIN_NAME: GainExample                    # juce_add_plugin(<this>) / PRODUCT_NAME, no spaces
+  VST3_TARGET: GainExample_VST3               # CMake target that builds the .vst3 (<PLUGIN_NAME>_VST3)
+  TEST_TARGET: GainExampleTest                # CMake target of the unit-test exe ("" = none)
+  ISS_FILE: installer/GainExample.iss         # Inno Setup script ("" = no installer)
+  # ---- pinned tools ----
+  PLUGINVAL_VERSION: v1.0.4
+  ORT_VERSION: "1.30.0"                       # official onnxruntime-win-x64 CPU zip
+  ORT_SHA256: c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949   # hash of that zip; re-check when you change ORT_VERSION
+  JUCE_TAG: ${{ inputs.juce_tag || '9.0.3' }}
+  BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+  STRICTNESS: ${{ inputs.strictness || '5' }}
+
+jobs:
+  windows-vst3:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # JUCE: shallow fetch of one tag, cached by tag. (The CMake file also knows how to fetch it itself; handing it
+      # a ready checkout via FETCHCONTENT_SOURCE_DIR_JUCE is faster and gives a cache you control.)
+      - name: JUCE from cache
+        id: juce
+        uses: actions/cache@v4
+        with:
+          path: JUCE
+          key: juce-${{ env.JUCE_TAG }}
+
+      - name: JUCE (pinned tag, shallow)
+        if: steps.juce.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git init -q JUCE && cd JUCE
+          git remote add origin https://github.com/juce-framework/JUCE.git
+          git fetch -q --depth 1 origin "$JUCE_TAG"
+          git checkout -q FETCH_HEAD
+          rm -rf .git
+
+      # Optional ONNX Runtime. Must run before configure so CMake sees ORT_ROOT.
+      - name: ONNX Runtime (CPU, pinned and hash-checked)
+        if: ${{ inputs.onnxruntime == true }}
+        shell: pwsh
+        run: ./scripts/fetch_onnxruntime.ps1 -Version $env:ORT_VERSION -Sha256 $env:ORT_SHA256 -OutDir ort
+
+      - name: MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compiler cache (sccache)
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure (Ninja)
+        shell: bash
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          # -D not /D for compiler flags: git-bash rewrites an argument that starts with / into a Windows path.
+          ort_arg=""; [ -n "${ORT_ROOT:-}" ] && ort_arg="-DORT_ROOT=$ORT_ROOT"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DFETCHCONTENT_SOURCE_DIR_JUCE="$PWD/JUCE" \
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            $ort_arg
+
+      - name: Build
+        shell: bash
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          targets="$VST3_TARGET"
+          if [ "${{ inputs.unit_tests }}" != "false" ] && [ -n "$TEST_TARGET" ]; then targets="$targets $TEST_TARGET"; fi
+          cmake --build build --config "$BUILD_TYPE" --target $targets --parallel
+          sccache --show-stats || true
+          find "build/${PLUGIN_NAME}_artefacts" -type f | sed 's/^/  /'
+
+      # The test is a plain console exe. It renders the editor to an image instead of opening a window, so it does not depend on
+      # the size of the runner's (virtual) display. continue-on-error is OFF: a red test should stop the release.
+      - name: Unit tests (headless)
+        if: ${{ inputs.unit_tests != false && env.TEST_TARGET != '' }}
+        shell: bash
+        run: |
+          "./build/${TEST_TARGET}_artefacts/${BUILD_TYPE}/${TEST_TARGET}.exe" 2>&1 | tee unittest.log
+          test "${PIPESTATUS[0]}" = 0
+
+      # Example of a "no plain-text strings in the binary" check. Edit the list or delete the step.
+      - name: Binary string check (example)
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem "build/${env:PLUGIN_NAME}_artefacts/${env:BUILD_TYPE}/VST3/${env:PLUGIN_NAME}.vst3" -Recurse -File -Filter *.vst3 | Select-Object -First 1
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($dll.FullName))
+          $bad = @(); foreach ($needle in @('EXAMPLE_PLAINTEXT_ANCHOR')) { if ($text.Contains($needle)) { $bad += $needle } }
+          if ($bad.Count -gt 0) { Write-Error "plain text found in $($dll.Name): $($bad -join ', ')"; exit 1 }
+          "OK: none of the listed strings in $($dll.Name)"
+
+      - name: pluginval (Tracktion) on the VST3
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/Tracktion/pluginval/releases/download/$env:PLUGINVAL_VERSION/pluginval_Windows.zip" -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          $exe = (Get-ChildItem pluginval -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force pluginval-logs | Out-Null
+          & $exe --strictness-level $env:STRICTNESS --validate-in-process --timeout-ms 600000 --verbose --output-dir pluginval-logs --validate "build/${env:PLUGIN_NAME}_artefacts/${env:BUILD_TYPE}/VST3/${env:PLUGIN_NAME}.vst3" 2>&1 | Tee-Object pluginval.log
+          if ($LASTEXITCODE -ne 0) { Write-Error "pluginval failed with $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      # ------------------------------------------------------------ the free route: a ZIP, no installer, unsigned
+      - name: ZIP package + SHA-256
+        if: ${{ inputs.package_zip != false }}
+        id: zip
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(\w+ VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force zip | Out-Null
+          ./scripts/make_zip.ps1 -Product $env:PLUGIN_NAME -Version $ver `
+              -Vst3 "build/${env:PLUGIN_NAME}_artefacts/${env:BUILD_TYPE}/VST3/${env:PLUGIN_NAME}.vst3" `
+              -OutDir (Resolve-Path zip)
+
+      - name: ZIP test (expand, copy into the system VST3 folder, pluginval that copy, remove)
+        if: ${{ inputs.package_zip != false }}
+        shell: pwsh
+        run: |
+          $pv = (Get-ChildItem pluginval -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
+          ./scripts/test_zip.ps1 -Product $env:PLUGIN_NAME -Zip "${{ steps.zip.outputs.zip }}" -Pluginval $pv -Strictness $env:STRICTNESS -LogDir zip/pluginval-logs-zip
+
+      - name: Upload the ZIP + SHA-256
+        if: ${{ inputs.package_zip != false }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.name }}
+          retention-days: 30
+          path: |
+            zip/*.zip
+            zip/*.sha256
+            zip/pluginval-logs-zip/
+
+      # ------------------------------------------------------------ optional: Inno Setup installer (preinstalled on the runner)
+      - name: Installer (ISCC) + SHA-256
+        if: ${{ inputs.installer == true && env.ISS_FILE != '' }}
+        id: installer
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(\w+ VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe", "C:\Program Files\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($iscc) { $iscc = $iscc.FullName } else { $iscc = (Get-Command iscc -ErrorAction Stop).Source }
+          $root = (Get-Location).Path
+          New-Item -ItemType Directory -Force installer-out | Out-Null
+          & $iscc "/DVersion=$ver" "/DBuildDir=$root\build" "/DOutDir=$root\installer-out" "$root\$($env:ISS_FILE -replace '/','\')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem installer-out -Filter *.exe | Select-Object -First 1
+          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$sha  $($exe.Name)" | Out-File -Encoding ascii "installer-out/$($exe.Name).sha256"
+          "name=$($exe.BaseName)" >> $env:GITHUB_OUTPUT
+          "## Windows installer`n- **$($exe.Name)** ($([math]::Round($exe.Length/1MB,2)) MB, unsigned)`n- SHA-256: ``$sha``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Install silently, pluginval the INSTALLED copy, upgrade, uninstall, check it is gone
+        if: ${{ inputs.installer == true && env.ISS_FILE != '' }}
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem installer-out -Filter *.exe | Select-Object -First 1).FullName
+          $vst3  = "C:\Program Files\Common Files\VST3\$($env:PLUGIN_NAME).vst3"
+          # the AppId from the .iss, without the doubled opening brace
+          $appId = [regex]::Match((Get-Content $env:ISS_FILE -Raw), 'AppId=\{\{([0-9A-Fa-f-]+)\}').Groups[1].Value
+          $key   = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{$appId}_is1"
+          function Install($log) {
+            $p = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=$log" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Write-Error "setup exit code $($p.ExitCode)"; exit 1 }
+          }
+          function Check($what, $ok) { if ($ok) { "OK    $what" } else { Write-Error "FAIL  $what"; exit 1 } }
+
+          Install "$PWD\installer-out\install-1.log"
+          Check "VST3 bundle installed at $vst3" (Test-Path "$vst3\Contents\x86_64-win\$($env:PLUGIN_NAME).vst3")
+          Check "registered in Apps & features" (Test-Path $key)
+
+          $pv = (Get-ChildItem pluginval -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
+          & $pv --strictness-level $env:STRICTNESS --validate-in-process --timeout-ms 600000 --output-dir pluginval-logs-installed --validate $vst3 2>&1 | Tee-Object installer-out/pluginval-installed.log | Select-Object -Last 3
+          Check "pluginval on the INSTALLED VST3" ($LASTEXITCODE -eq 0)
+
+          "stale file from an older version" | Out-File "$vst3\Contents\stale.txt"
+          Install "$PWD\installer-out\install-2-upgrade.log"
+          Check "re-install over itself works" (Test-Path "$vst3\Contents\x86_64-win\$($env:PLUGIN_NAME).vst3")
+          Check "the upgrade removed files left by the older version" (-not (Test-Path "$vst3\Contents\stale.txt"))
+
+          $un = (Get-ItemProperty $key).UninstallString.Trim('"')
+          $p = Start-Process -FilePath $un -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
+          Check "silent uninstall exit code 0" ($p.ExitCode -eq 0)
+          Check "VST3 bundle removed" (-not (Test-Path $vst3))
+          Check "uninstall registry key removed" (-not (Test-Path $key))
+
+      - name: Upload the installer (unsigned) + SHA-256 + install logs
+        if: ${{ inputs.installer == true && env.ISS_FILE != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.installer.outputs.name }}
+          retention-days: 30
+          path: |
+            installer-out/*.exe
+            installer-out/*.sha256
+            installer-out/*.log
+
+      - name: Upload the raw VST3 and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-windows-x64-vst3-unsigned
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/${{ env.PLUGIN_NAME }}_artefacts/${{ env.BUILD_TYPE }}/VST3/
+            unittest.log
+            pluginval.log
+            pluginval-logs/
